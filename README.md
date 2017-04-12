@@ -25,7 +25,7 @@ Usage
 ------
 
 ```
-ruby validate-hls.rb http://host/path/playlist.m3u8
+ruby validate-hls.rb "http://host/path/playlist.m3u8"
 ```
 
 This will download, validate and print results for each `.m3u8` and `.ts` URL.
