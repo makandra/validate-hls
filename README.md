@@ -28,6 +28,8 @@ Usage
 ruby validate-hls.rb http://host/path/playlist.m3u8
 ```
 
+This will download, validate and print results for each `.m3u8` and `.ts` URL.
+
 The URL can point to either a playlist of `.ts` files, or to a master playlist of multiple quality playlists.
 
 
