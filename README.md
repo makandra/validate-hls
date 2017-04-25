@@ -32,6 +32,10 @@ This will download, validate and print results for each `.m3u8` and `.ts` URL.
 
 The URL can point to either a playlist of `.ts` files, or to a master playlist of multiple quality playlists.
 
+You can also pass more than one playlist URL as multiple arguments to `validate-hls.rb`, in which case all URLs will be validated.
+
+The script returns an error code if there was at least one validation error.
+
 
 Credits
 -------
