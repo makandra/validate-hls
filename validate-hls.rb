@@ -5,8 +5,9 @@ module ValidateHls
 
   class Error < StandardError; end
   class CommandFailed < Error; end
-  class DownloadFailed < CommandFailed; end
+  class DownloadFailed < Error; end
   class Invalid < Error; end
+  class InvalidChild < Error; end
   class MissingDependency < Error; end
 
   module Util
@@ -46,11 +47,17 @@ module ValidateHls
     include WithinTempDir
     include Util
 
-    def initialize(url)
+    def initialize(url, log)
       @url = url
+      @log = log
     end
 
-    attr_reader :url
+    attr_reader :url, :log
+
+    def to_s
+      name = self.class.name.split('::').last
+      "#{name}(#{url})"
+    end
 
     private
 
@@ -64,11 +71,8 @@ module ValidateHls
 
     def download
       within_temp_dir do
-        begin
-          run 'wget', url
-        rescue DownloadFailed
-          puts "Download failed ✘"
-        end
+        run 'wget', url
+        log.positive_message('Downloadable with 200 OK')
       end
     end
 
@@ -94,29 +98,47 @@ module ValidateHls
 
   class Playlist < Resource
 
-    def validate
-      print "Validating playlist #{url}: "
+    def validate!
+      log.subject_started(self)
       download
       parse_urls
-
-      if playlist_urls.size == 0 && fragment_urls.size == 0
-        puts "No URLs found in playlist ✘"
-      else
-        puts 'Has URLs ✔'
-        playlist_urls.each do |playlist_url|
-          playlist = Playlist.new(playlist_url)
-          playlist.validate
-        end
-        fragment_urls.each do |fragment_url|
-          fragment = Fragment.new(fragment_url)
-          fragment.validate
-        end
-      end
+      validate_children
+      log.subject_passed(self)
+    rescue Error => e
+      log.negative_message(e.message)
+      log.subject_failed(self)
+      raise Invalid, e.message
     end
 
     private
 
     attr_reader :playlist_urls, :fragment_urls
+
+    def validate_children
+      child_error = false
+      playlist_urls.each do |playlist_url|
+        begin
+          playlist = Playlist.new(playlist_url, log)
+          playlist.validate!
+        rescue Error => e
+          child_error = true
+        end
+      end
+      fragment_urls.each do |fragment_url|
+        begin
+          fragment = Fragment.new(fragment_url, log)
+          fragment.validate!
+        rescue Error => e
+          child_error = true
+        end
+      end
+
+      if child_error
+        # e.message was already printed by child, so just explain that we're failing
+        # because of a child failure
+        raise Invalid, 'Error in child resource'
+      end
+    end
 
     def parse_urls
       @fragment_urls = []
@@ -131,35 +153,47 @@ module ValidateHls
           @playlist_urls << full_url(line)
         end
       end
+
+      if playlist_urls.size == 0 && fragment_urls.size == 0
+        raise Invalid, 'No URLs found in playlist'
+      end
+
     end
 
   end
 
   class Fragment < Resource
 
-    def validate
-      print "Validating fragment #{url}: "
+    def validate!
+      log.subject_started(self)
       download
-
-      begin
-        ffprobe_out = run('ffprobe', '-select_streams', 'v:0', '-show_frames', local_path)
-        keyframe_lines = ffprobe_out.scan(/key_frame=\d/)
-
-        if keyframe_lines.size == 0
-          puts "No frames found ✘"
-        elsif !keyframe_lines.include?('key_frame=1')
-          puts "No keyframes found in any frame ✘"
-        elsif keyframe_lines[0] != 'key_frame=1'
-          puts "Keyframe is not the first frame ✘"
-        else
-          puts 'Keyframe is first frame ✔'
-        end
-
-      rescue CommandFailed => e
-        puts "Keyframe analysis failed ✘"
-      end
-
+      validate_frames
+      log.subject_passed(self)
+    rescue Error => e
+      log.negative_message(e.message)
+      log.subject_failed(self)
+      raise Invalid, e.message
     end
+
+    private
+
+    def validate_frames
+      ffprobe_out = run('ffprobe', '-select_streams', 'v:0', '-show_frames', local_path)
+      keyframe_lines = ffprobe_out.scan(/key_frame=\d/)
+
+      if keyframe_lines.size == 0
+        raise Invalid, "No frames found"
+      elsif !keyframe_lines.include?('key_frame=1')
+        raise Invalid, "No keyframes found in any frame"
+      elsif keyframe_lines[0] != 'key_frame=1'
+        raise Invalid, "Keyframe is not the first frame"
+      else
+        log.positive_message 'Keyframe is first frame'
+      end
+    rescue CommandFailed => e
+      raise Invalid, "Keyframe analysis failed: #{e.message}"
+    end
+
   end
 
   module Dependencies
@@ -183,55 +217,159 @@ module ValidateHls
 
   end
 
-  class Validator
+  class Log
 
-    def initialize(url)
-      @url = url
+    COLOR_HEAD = "\e[44;97m"
+    COLOR_WARNING = "\e[33m"
+    COLOR_POSITIVE = "\e[32m"
+    COLOR_NEGATIVE = "\e[31m"
+    COLOR_RESET = "\e[0m"
+
+    def initialize
+      @target = STDOUT
+      @indent_level = 0
+      @success = true
     end
 
-    def run
-      check_url
-      check_dependencies
-      validate
-      print_banner
-      print_result
-      puts "Stream passed validation"
-      exit 0
+    def subject_started(subject)
+      puts "Validating: #{subject}"
+      @indent_level += 1
+    end
+
+    def subject_passed(subject)
+      # positive_message "Passed"
+      @indent_level -= 1
+    end
+
+    def subject_failed(subject)
+      # negative_message "Failed"
+      @indent_level -= 1
+    end
+
+    def head(message)
+      puts message, COLOR_HEAD
+    end
+
+    def positive_message(message)
+      puts "✔ #{message}", COLOR_POSITIVE
+    end
+
+    def negative_message(message)
+      @success = false
+      puts "✘ #{message}", COLOR_NEGATIVE
+    end
+
+    def puts(string = '', color = nil)
+      lines = string.strip.split(/\n/)
+      lines = [''] if lines.size == 0
+      indent_string = "| " * @indent_level
+      lines.each do |line|
+        @target.print indent_string
+        @target.print color if color # don't colorize background for the indentation
+        @target.print line
+        @target.print COLOR_RESET if color
+        @target.print "\n"
+      end
+    end
+
+    def success?
+      @success
+    end
+
+  end
+
+  class PlaylistSet
+
+    def initialize(urls, log)
+      @urls = urls
+      @log = log
+    end
+
+    attr_reader :urls, :log
+
+    def validate!
+      log.subject_started(self)
+      validate_children
+      log.subject_passed(self)
     rescue Error => e
-      puts e.message
+      log.negative_message(e.message)
+      log.subject_failed(self)
+      raise Invalid, e.message
+    end
+
+    def to_s
+      "Set of #{urls.size} URL(s)"
+    end
+
+    private
+
+    def validate_children
+      child_error = false
+      @urls.each do |url|
+        begin
+          playlist = Playlist.new(url, @log)
+          playlist.validate!
+        rescue Error => e
+          child_error = true
+        end
+      end
+
+      if child_error
+        # e.message was already printed by child, so just explain that we're failing
+        # because of a child failure
+        raise Invalid, 'One or more playlists had errors'
+      end
+    end
+
+  end
+
+  class Validator
+
+    def initialize(urls)
+      @urls = Array[*urls] # Array.wrap without ActiveSupport
+      @log = Log.new
+    end
+
+    attr_reader :urls, :log
+
+    def run
+      print_banner
+      check_urls
+      check_dependencies
+      validate!
+      error_code = @log.success? ? 1 : 0
+      exit error_code
+    rescue Error => e
+      log.negative_message "Validation failed: #{e.message}"
       exit 1
     end
 
     private
 
+    def validate!
+      set = PlaylistSet.new(urls, log)
+      set.validate!
+    end
+
     def check_dependencies
       Dependencies.check
     end
 
-    def check_url
-      @url.is_a?(String) && @url.size > 0 or raise Error, "Must give URL to .m3u8 playlist as first argument"
+    def check_urls
+      unless @urls && @urls.size > 0
+        raise Error, "Must pass one or more URLs to .m3u8 playlists as arguments"
+      end
     end
 
     def print_banner
-      puts <<~BANNER
-
-      BANNER
-      puts "HLS Stream verifier"
-      puts "-------------------"
-      puts
-      puts
-      puts
-      puts "This script checks:"
-      puts "- Whether all .ts fragments can be downloaded"
-      puts "- Whether all .ts fragments have video frames"
-      puts "- Whether all .ts fragments start with a keyframe"
-      puts
+      log.puts
+      log.head "validate-hls"
+      log.puts
     end
 
   end
 
 end
 
-playlist_url = ARGV[0]
-validator = ValidateHls::Validator.new(playlist_url)
+validator = ValidateHls::Validator.new(ARGV)
 validator.run
